@@ -1,123 +1,132 @@
-# Pipeline de Indicadores Econômicos
+# Economic Indicators Pipeline
 
-Pipeline em Python que extrai **cotação do dólar**, **Meta Selic** e **IPCA** da API pública do Banco Central, cruza as séries e armazena tudo no **Snowflake**, pronto para responder perguntas como:
+A Python pipeline that extracts the **USD/BRL exchange rate**, the **Selic target rate** and **IPCA inflation** from the Central Bank of Brazil's public APIs, joins the series and loads everything into **Snowflake**, ready to answer questions like:
 
-> *"Qual foi o dólar médio de cada mês e quanto foi a inflação naquele mês?"*
+> *"What was the average dollar rate each month, and what was inflation in that same month?"*
 
-> 🚧 **Projeto em desenvolvimento.** Veja o [roadmap](#roadmap) para o que já está pronto.
-
----
-
-## Por que este projeto existe
-
-É um projeto de estudo em engenharia de dados, construído à mão, com regras restritivas de propósito:
-
-- **Sem pandas.** Toda transformação é feita com listas, dicionários e sets, o que obriga a pensar em estrutura de dados e complexidade.
-- **Só `requests` + biblioteca padrão** (`datetime`, `logging`, `json`, `argparse`...), além do conector oficial do banco.
-- **Snowflake** como destino dos dados, para praticar a carga num data warehouse em nuvem.
-
-O objetivo é praticar os fundamentos que uma ferramenta pronta esconderia: paginação de API, retry, deduplicação, junção de séries com frequências diferentes, idempotência e carga incremental.
+> **Status:** under active development. See the [roadmap](#roadmap).
 
 ---
 
-## Fontes de dados
+## Tech stack
 
-As séries vêm de duas APIs públicas do Banco Central:
+| Layer | Tools |
+|---|---|
+| Language | Python |
+| Extraction | `requests` |
+| Transformation | `pandas` |
+| Storage | Snowflake (`snowflake-connector-python`) |
 
-| Série | API | Identificador | Frequência | Unidade |
+## Key engineering problems
+
+- **API windowing:** splitting long date ranges to respect per-request limits.
+- **Resilience:** retries with exponential backoff, and controlled failure on network loss.
+- **Joining mixed frequencies:** daily exchange rates, event-driven Selic changes and monthly IPCA.
+- **Idempotent writes:** rerunning the pipeline never duplicates rows.
+- **Incremental loads:** fetching only the dates not yet stored.
+
+---
+
+## Data sources
+
+The series come from two public APIs of the Central Bank of Brazil (BCB):
+
+| Series | API | Identifier | Frequency | Unit |
 |---|---|---|---|---|
-| Dólar (venda) | PTAX | `CotacaoDolarPeriodo` | Diária (dias úteis) | R$ |
-| Meta Selic (Copom) | SGS | código `432` | Muda nas reuniões do Copom | % a.a. |
-| IPCA (variação mensal) | SGS | código `433` | Mensal | % no mês |
+| USD/BRL (selling rate) | PTAX | `CotacaoDolarPeriodo` | Daily (business days) | BRL |
+| Selic target rate (set by Copom) | SGS | code `432` | Changes at Copom meetings | % per year |
+| IPCA (monthly change) | SGS | code `433` | Monthly | % per month |
 
-**PTAX** (cotações oficiais de câmbio, padrão OData):
+*Selic is Brazil's benchmark interest rate, set by the Monetary Policy Committee (Copom). IPCA is Brazil's official consumer price index.*
 
-```
-https://olinda.bcb.gov.br/olinda/servico/PTAX/versao/v1/odata/CotacaoDolarPeriodo(dataInicial=@dataInicial,dataFinalCotacao=@dataFinalCotacao)?@dataInicial='mm-dd-aaaa'&@dataFinalCotacao='mm-dd-aaaa'&$format=json
-```
-
-**SGS** (Sistema Gerenciador de Séries Temporais):
+**PTAX** (official exchange rates, OData standard):
 
 ```
-https://api.bcb.gov.br/dados/serie/bcdata.sgs.{codigo}/dados?formato=json&dataInicial=dd/mm/aaaa&dataFinal=dd/mm/aaaa
+https://olinda.bcb.gov.br/olinda/servico/PTAX/versao/v1/odata/CotacaoDolarPeriodo(dataInicial=@dataInicial,dataFinalCotacao=@dataFinalCotacao)?@dataInicial='mm-dd-yyyy'&@dataFinalCotacao='mm-dd-yyyy'&$format=json
 ```
 
-### Comportamentos das APIs observados na prática
+**SGS** (Time Series Management System):
 
-As APIs não têm documentação formal, então estes pontos foram descobertos testando.
+```
+https://api.bcb.gov.br/dados/serie/bcdata.sgs.{code}/dados?formato=json&dataInicial=dd/mm/yyyy&dataFinal=dd/mm/yyyy
+```
+
+### API behavior observed in practice
+
+Neither API has formal documentation. The behavior below was mapped through direct testing against the endpoints.
 
 **PTAX**
 
-- **A resposta é um objeto, não uma lista.** Os registros ficam em `resposta["value"]`, com campos como `cotacaoVenda` (número) e `dataHoraCotacao` (texto com data e hora).
-- **As datas usam o formato `mm-dd-aaaa` entre aspas simples** na requisição, porque é assim que o OData representa um texto literal.
+- **The response is an object, not a list.** Records live in `response["value"]`, with fields such as `cotacaoVenda` (a number) and `dataHoraCotacao` (a date-time string).
+- **Dates use the `mm-dd-yyyy` format wrapped in single quotes** in the request, because that is how OData represents a string literal.
 
 **SGS**
 
-- **Os valores vêm como string.** A resposta é `[{"data": "01/10/2026", "valor": "0.14"}]`, e tanto `data` quanto `valor` precisam ser convertidos.
-- **As datas usam o formato `dd/mm/aaaa`**, tanto na requisição quanto na resposta.
-- **Um `404` nem sempre é erro.** Um período sem dados devolve `404` com `Value(s) not found` no corpo, e isso deve ser tratado como lista vazia, sem retry.
-- **O IPCA tem defasagem.** O IBGE divulga o índice de um mês por volta do dia 10 do mês seguinte, então o mês corrente nunca tem IPCA.
-- **Há um limite de período por consulta** nas séries diárias, o que exige quebrar intervalos longos em janelas. *(Limite exato: a documentar.)*
+- **Values come back as strings.** The response looks like `[{"data": "01/10/2026", "valor": "0.14"}]`, and both `data` and `valor` need to be converted.
+- **Dates use the `dd/mm/yyyy` format**, in both the request and the response.
+- **A `404` is not always an error.** A period with no data returns `404` with `Value(s) not found` in the body. It should be treated as an empty list and not retried.
+- **IPCA is published with a lag.** IBGE (the national statistics office) releases each month's index around the 10th of the following month, so the current month never has an IPCA value.
+- **Daily series have a maximum period per request**, so long ranges must be split into request windows.
 
-Como as duas APIs têm formatos diferentes, a transformação converte as duas para uma estrutura comum (`data`, `valor`) antes de cruzar as séries.
+Because the two APIs return different formats, the transformation step converts both into a common shape (`date`, `value`) before joining the series.
 
 ---
 
-## Arquitetura
+## Architecture
 
 ```
  ┌──────────────┐     ┌──────────────────┐     ┌─────────────────────┐
- │  API do BCB  │ ──▶ │    Extração      │ ──▶ │   Transformação     │
- │ (PTAX + SGS) │     │  janelas + retry │     │  tipos, dedup,      │
- └──────────────┘     └──────────────────┘     │  Selic vigente,     │
-                                               │  médias mensais     │
+ │   BCB APIs   │ ──▶ │    Extraction    │ ──▶ │   Transformation    │
+ │ (PTAX + SGS) │     │ windows + retry  │     │  types, dedup,      │
+ └──────────────┘     └──────────────────┘     │  current Selic,     │
+                                               │  monthly averages   │
                                                └──────────┬──────────┘
                                                           ▼
                                                ┌─────────────────────┐
-                                               │  Carga (Snowflake)  │
-                                               │  idempotente e      │
+                                               │  Load (Snowflake)   │
+                                               │  idempotent and     │
                                                │  incremental        │
                                                └─────────────────────┘
 ```
 
-### Tabelas
+### Tables
 
-| Tabela | Conteúdo | Granularidade |
+| Table | Contents | Grain |
 |---|---|---|
-| `raw_series` | Dados brutos: `codigo`, `data`, `valor` | 1 linha por série por data |
-| `diario` | `data`, `dolar`, `selic_vigente` | 1 linha por dia com cotação |
-| `mensal` | `mes`, `dolar_medio`, `ipca` | 1 linha por mês |
+| `raw_series` | Raw data: `codigo`, `data`, `valor` | 1 row per series per date |
+| `diario` (daily) | `data`, `dolar`, `selic_vigente` (Selic in effect) | 1 row per day with an exchange rate |
+| `mensal` (monthly) | `mes`, `dolar_medio`, `ipca` | 1 row per month |
 
 ---
 
-## Como rodar
+## Getting started
 
-**Pré-requisitos:** Python 3.10+ e uma conta Snowflake (o trial gratuito serve).
+**Requirements:** Python 3.10+ and a Snowflake account (the free trial works).
 
 ```bash
-git clone <url-do-repositorio>
+git clone <repository-url>
 cd Pipeline_indicadores_economicos
-pip install requests snowflake-connector-python
+pip install requests pandas snowflake-connector-python
 ```
 
-**Credenciais:** o pipeline lê a conexão de variáveis de ambiente. As credenciais nunca ficam no código nem no repositório.
+**Credentials:** the pipeline reads its connection settings from environment variables. Credentials never go in the code or the repository.
 
-| Variável | Exemplo |
+| Variable | Example |
 |---|---|
 | `SNOWFLAKE_ACCOUNT` | `abc12345.sa-east-1` |
-| `SNOWFLAKE_USER` | `meu_usuario` |
-| `SNOWFLAKE_PASSWORD` | *(sua senha)* |
+| `SNOWFLAKE_USER` | `my_user` |
+| `SNOWFLAKE_PASSWORD` | *(your password)* |
 | `SNOWFLAKE_WAREHOUSE` | `COMPUTE_WH` |
 | `SNOWFLAKE_DATABASE` | `INDICADORES` |
 | `SNOWFLAKE_SCHEMA` | `PUBLIC` |
 
-**Hoje** (extração exploratória):
+**Current entry point** (extraction):
 
 ```bash
 python Extract.py
 ```
 
-**Quando o pipeline estiver completo:**
+**Target CLI** (Stage 5):
 
 ```bash
 python pipeline.py --desde 2015-01-01
@@ -125,36 +134,38 @@ python pipeline.py --desde 2015-01-01
 
 ---
 
-## Decisões técnicas
+<!--
+## Technical decisions
 
-> Seção preenchida conforme cada etapa é concluída.
+Uncomment and fill in each item as its stage is completed:
 
-- **Selic vigente por dia (Desafio 1):** *a documentar: abordagem escolhida e complexidade Big-O.*
-- **Deduplicação e idempotência:** *a documentar: como rodar duas vezes não duplica linhas.*
-- **Carga incremental:** *a documentar: como o pipeline descobre o que já está no banco.*
-- **Falhas de rede:** *a documentar: estratégia de retry e como o banco é protegido de escrita parcial.*
+- **Selic in effect for each day:** approach and Big-O complexity.
+- **Deduplication and idempotency:** how a rerun never duplicates rows.
+- **Incremental load:** how the pipeline finds what is already loaded.
+- **Network failures:** retry strategy and protection against partial writes.
 
 ---
+-->
 
 ## Roadmap
 
-- [ ] **Etapa 1: Extração**
-  - [x] Dólar consumido da API PTAX
-  - [x] Selic e IPCA consumidos da API SGS
-  - [ ] Funções de busca para cada API, com interface comum `(inicio, fim)`
-  - [ ] Retry com backoff exponencial (1s, 2s, 4s)
-  - [ ] Quebra automática de períodos longos em janelas
-- [ ] **Etapa 2: Transformação**
-  - [ ] Conversão de tipos com descarte e log de linhas inválidas
-  - [ ] Remoção de duplicados
-  - [ ] Selic vigente para cada dia com cotação
-  - [ ] Dólar médio mensal + IPCA do mês
-- [ ] **Etapa 3: Carga**: tabelas `raw_series`, `diario` e `mensal`, sem duplicação
-- [ ] **Etapa 4: Carga incremental**: buscar só as datas que ainda não estão no banco
-- [ ] **Etapa 5: Acabamento**: CLI, log em arquivo e resumo da execução
+- [ ] **Stage 1: Extraction**
+  - [x] USD/BRL fetched from the PTAX API
+  - [x] Selic and IPCA fetched from the SGS API
+  - [ ] Fetch functions for each API with a common `(start, end)` interface
+  - [ ] Retry with exponential backoff (1s, 2s, 4s)
+  - [ ] Automatic splitting of long periods into windows
+- [ ] **Stage 2: Transformation**
+  - [ ] Type conversion, with invalid rows discarded and logged
+  - [ ] Duplicate removal
+  - [ ] Selic in effect for each day with an exchange rate
+  - [ ] Monthly average dollar rate + that month's IPCA
+- [ ] **Stage 3: Load**: `raw_series`, `diario` and `mensal` tables, with no duplicates
+- [ ] **Stage 4: Incremental load**: fetch only the dates not yet in the database
+- [ ] **Stage 5: Finishing touches**: CLI, file logging and a run summary
 
 ### Extras
 
-- [ ] Testes com `pytest` para as funções de transformação
-- [ ] Extração paralela com `ThreadPoolExecutor`
-- [ ] Container Docker
+- [ ] `pytest` tests for the transformation functions
+- [ ] Parallel extraction with `ThreadPoolExecutor`
+- [ ] Docker container
